@@ -11,11 +11,16 @@ from flask import Flask, jsonify, request
 import time
 import uuid
 from datetime import datetime
+from redis import Redis
+from tasks import send_notification
+from rq.job import Job
+import os
 
 app = Flask(__name__)
 
 # In-memory store for notifications
 notifications = {}
+redis_conn = Redis.from_url(os.getenv("REDIS_URL", "redis://localhost:6379/0"))
 
 
 def send_notification_sync(notification_id, email, message):
@@ -75,6 +80,7 @@ def create_notification():
 
     # THIS IS THE PROBLEM: We block here for 3 seconds!
     # The user can't do anything while we wait.
+    '''
     result = send_notification_sync(notification_id, email, message)
 
     notification = {
@@ -87,6 +93,49 @@ def create_notification():
     notifications[notification_id] = notification
 
     return jsonify(notification), 201
+    '''
+    notification = {
+        "id" : notification_id,
+        "email" : email,
+        "status" : "queued",
+        "sent_at" : None
+    }
+    notifications[notification_id] = notification
+
+    job = send_notification.delay(notification_id, email, message)
+
+    return jsonify({
+        "message" : "Notification queued",
+        "notification_id" : notification_id,
+        "job_id" : job.id,
+        "status" : "queued"
+    }), 202
+
+@app.route('/jobs/<job_id>', methods=['GET'])
+def get_job_status(job_id):
+    try:
+        job = Job.fetch(job_id, connection=redis_conn)
+    except Exception:
+        return jsonify({"error": "Job not found"}), 404
+    
+    response = {
+        "job_id" : job.id,
+        "status" : job.get_status()
+    }
+
+    if job.is_finished:
+        response["result"] = job.result
+        result = job.result
+        notification_id = result["notification_id"]
+
+        if notification_id in notifications:
+            notifications[notification_id]["status"] = result["status"]        
+            notifications[notification_id]["sent_at"] = result["sent_at"]  
+    elif job.is_failed:
+        response["error"] = str(job.exc_info)
+
+    return jsonify(response)
+
 
 
 @app.route('/notifications', methods=['GET'])
